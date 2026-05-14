@@ -79,46 +79,78 @@ async def save_task_list(message: types.Message):
         await session.commit()
         logging.info(f"Updated task list from {task_list.user_full_name}: {completed}/{total}")
 
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await message.answer("Привет! Я — Аналитик планов. Добавь меня в группу, сделай админом, и я буду следить за выполнением задач. 🚀")
+# Фильтр для ограничения команд
+def is_admin(message: types.Message):
+    return message.from_user.id == ADMIN_ID
 
-@dp.message(F.text)
-async def handle_message(message: types.Message):
-    # Если это сообщение с текстом '... поставил(а) отметку о выполнении ...'
-    # Это системное уведомление от бота 'Далее' или нативного функционала ТГ.
-    # Мы можем использовать это как сигнал к тому, что нужно перечитать последний список пользователя.
-    if "поставил(а) отметку о выполнении" in message.text:
-        logging.info(f"Detected task completion notification: {message.text}")
-        # Здесь можно добавить логику поиска сообщения, к которому это относится, 
-        # но проще всего дождаться edited_message от самого списка.
+@dp.message(Command("start"), F.chat.type == "private")
+async def cmd_start(message: types.Message):
+    if not is_admin(message):
+        await message.answer("ты не Вера, я тебе не помогу)")
+        return
+    await message.answer("Привет, Вера! Я — твой личный Аналитик планов. 🕵️‍♀️\n\nЯ тихо собираю данные в группе, а здесь буду отвечать только тебе.\n\nИспользуй /report, чтобы получить срез по задачам.")
+
+@dp.message(Command("report"), F.chat.type == "private")
+async def cmd_report(message: types.Message):
+    if not is_admin(message):
+        await message.answer("ты не Вера, я тебе не помогу)")
         return
 
+    async with async_session() as session:
+        # Получаем все списки
+        stmt = select(TaskList).order_by(TaskList.user_full_name, TaskList.created_at.desc())
+        result = await session.execute(stmt)
+        all_lists = result.scalars().all()
+        
+        if not all_lists:
+            await message.answer("Данных пока нет. Я начну собирать их, как только в группе появятся новые списки задач.")
+            return
+
+        report = "📊 **Анализ выполнения задач:**\n\n"
+        
+        users_stats = {}
+        for l in all_lists:
+            if l.user_full_name not in users_stats:
+                users_stats[l.user_full_name] = {"total": 0, "done": 0, "pending_examples": []}
+            
+            users_stats[l.user_full_name]["total"] += l.total_tasks
+            users_stats[l.user_full_name]["done"] += l.completed_tasks
+            
+            if l.completed_tasks < l.total_tasks:
+                items_stmt = select(TaskItem).where(TaskItem.list_id == l.id, TaskItem.is_completed == False).limit(2)
+                items_res = await session.execute(items_stmt)
+                pending = items_res.scalars().all()
+                for p in pending:
+                    clean_text = p.text.replace("🔘", "").replace("⚪", "").strip()
+                    users_stats[l.user_full_name]["pending_examples"].append(f"• {clean_text}")
+
+        for user, data in users_stats.items():
+            percent = (data["done"] / data["total"] * 100) if data["total"] > 0 else 0
+            report += f"👤 **{user}**\n"
+            report += f"└ Прогресс: {data['done']}/{data['total']} ({percent:.1f}%)\n"
+            if data["pending_examples"]:
+                report += f"└ Что тянет (примеры):\n" + "\n".join(data["pending_examples"][:3]) + "\n"
+            report += "\n"
+
+        await message.answer(report, parse_mode="Markdown")
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}))
+async def handle_group_message(message: types.Message):
+    # Если это сообщение с текстом '... поставил(а) отметку о выполнении ...'
+    if message.text and "поставил(а) отметку о выполнении" in message.text:
+        return
     await save_task_list(message)
 
-@dp.edited_message(F.text)
-async def handle_edited_message(edited_message: types.Message):
+@dp.edited_message(F.chat.type.in_({"group", "supergroup"}))
+async def handle_group_edit(edited_message: types.Message):
     await save_task_list(edited_message)
 
-@dp.message(Command("report"))
-async def cmd_report(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
-    
-    async with async_session() as session:
-        stmt = select(TaskList).order_by(TaskList.created_at.desc()).limit(10)
-        result = await session.execute(stmt)
-        lists = result.scalars().all()
-        
-        if not lists:
-            await message.answer("Пока нет данных для отчета.")
-            return
-            
-        report = "📊 **Последние 10 списков задач:**\n\n"
-        for l in lists:
-            status = "✅" if l.completed_tasks == l.total_tasks and l.total_tasks > 0 else "⏳"
-            report += f"{status} {l.user_full_name} ({l.created_at.strftime('%d.%m')}): {l.completed_tasks}/{l.total_tasks}\n"
-            
-        await message.answer(report, parse_mode="Markdown")
+@dp.message(F.chat.type == "private")
+async def handle_private_ignore(message: types.Message):
+    if not is_admin(message):
+        await message.answer("ты не Вера, я тебе не помогу)")
+        return
+    await message.answer("Я понимаю только команду /report")
 
 async def main():
     await init_db()
