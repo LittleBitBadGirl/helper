@@ -1,8 +1,8 @@
-version: '3.8'
-
 services:
   bot:
     build: .
+    environment:
+      - PYTHONUNBUFFERED=1
     env_file:
       - .env
     volumes:

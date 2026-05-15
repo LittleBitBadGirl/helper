@@ -21,5 +21,6 @@ jobs:
           passphrase: ${{ secrets.SSH_PASSPHRASE }}
           script: |
             cd /root/projects/analitics_manager
-            git pull origin main
-            docker-compose up -d --build
+            git fetch origin main
+            git reset --hard origin/main
+            docker compose up -d --build
