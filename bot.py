@@ -5,69 +5,95 @@ from aiogram.filters import Command
 from datetime import datetime
 
 from config import BOT_TOKEN, ADMIN_ID
-from database import init_db, async_session
-from models import TaskList, TaskItem
 from sqlalchemy import select, update, delete
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
+from database import init_db, async_session
+from models import TaskList, TaskItem
+
 # Инициализация бота
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-def parse_entities(message: types.Message):
-    """
-    Пытаемся вытащить структуру чек-листа из текста.
-    """
+def _parse_native_checklist(checklist) -> tuple[int, int, list]:
+    """Parse Telegram native checklist (Bot API 9.1+, aiogram 3.21+)."""
+    tasks = []
+    completed = 0
+    for task in checklist.tasks:
+        is_done = bool(task.completion_date and task.completion_date > 0) or task.completed_by_user is not None
+        if is_done:
+            completed += 1
+        tasks.append((task.text, is_done))
+    return len(tasks), completed, tasks
+
+
+def _parse_text_heuristics(text: str) -> tuple[int, int, list]:
+    """Fallback: extract checklist items from plain text via heuristics."""
     total = 0
     completed = 0
     tasks = []
-    
-    if not message.text:
-        return total, completed, tasks
-
-    lines = message.text.split('\n')
-    for line in lines:
+    for line in text.split('\n'):
         line = line.strip()
-        if not line: continue
-        
-        # Эвристика для чек-листов
-        is_done = False
+        if not line:
+            continue
         if "✅" in line or "☑️" in line or "✓" in line:
-            is_done = True
             completed += 1
             total += 1
             tasks.append((line, True))
-        elif "🔘" in line or "⚪" in line or "○" in line or (line[0].isdigit() and (line.find('.') != -1 or line.find('/') != -1)):
+        elif (
+            "🔘" in line or "⚪" in line or "○" in line
+            or (line[0].isdigit() and (line.find('.') != -1 or line.find('/') != -1))
+        ):
             total += 1
             tasks.append((line, False))
-            
     return total, completed, tasks
+
+
+def parse_entities(message: types.Message) -> tuple[int, int, list]:
+    """Extract checklist structure: tries native Telegram checklist first, then text heuristics."""
+    if message.checklist:
+        return _parse_native_checklist(message.checklist)
+    if message.text:
+        return _parse_text_heuristics(message.text)
+    return 0, 0, []
+
+def _raw_text(message: types.Message) -> str:
+    """Return a human-readable representation of the message content for storage."""
+    if message.checklist:
+        lines = [message.checklist.title] + [t.text for t in message.checklist.tasks]
+        return "\n".join(lines)
+    return message.text or ""
+
 
 async def save_task_list(message: types.Message):
     total, completed, tasks = parse_entities(message)
-    if total == 0: return # Не список или не распознали
+    if total == 0:
+        return
+
+    sender = message.from_user
+    if not sender:
+        return  # service messages have no sender; skip
 
     async with async_session() as session:
-        # Проверяем, есть ли уже такой список
         stmt = select(TaskList).where(TaskList.message_id == message.message_id, TaskList.chat_id == message.chat.id)
         result = await session.execute(stmt)
         task_list = result.scalar_one_or_none()
 
+        raw = _raw_text(message)
         if not task_list:
             task_list = TaskList(
                 message_id=message.message_id,
                 chat_id=message.chat.id,
-                user_id=message.from_user.id,
-                user_full_name=message.from_user.full_name,
-                raw_text=message.text
+                user_id=sender.id,
+                user_full_name=sender.full_name,
+                raw_text=raw,
             )
             session.add(task_list)
             await session.flush()
         else:
-            task_list.raw_text = message.text
-            # Очищаем старые пункты
+            task_list.raw_text = raw
             await session.execute(delete(TaskItem).where(TaskItem.list_id == task_list.id))
 
         task_list.total_tasks = total
@@ -136,13 +162,18 @@ async def cmd_report(message: types.Message):
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 async def handle_group_message(message: types.Message):
-    # Если это сообщение с текстом '... поставил(а) отметку о выполнении ...'
+    # Skip old-style text service messages about task completion
     if message.text and "поставил(а) отметку о выполнении" in message.text:
+        return
+    # checklist_tasks_done: service message — the linked checklist message was updated,
+    # handle via edited_message handler; nothing to do here directly.
+    if message.checklist_tasks_done:
         return
     await save_task_list(message)
 
 @dp.edited_message(F.chat.type.in_({"group", "supergroup"}))
 async def handle_group_edit(edited_message: types.Message):
+    # Fired when checklist tasks are marked done/undone — message.checklist will have fresh state
     await save_task_list(edited_message)
 
 @dp.message(F.chat.type == "private")
