@@ -14,3 +14,4 @@
 - Исправлен путь к БД: теперь используется абсолютный путь внутри контейнера, что решило ошибку `unable to open database file`.
 - Исправлен Workflow деплоя: `docker-compose` заменен на `docker compose`.
 - Настроены небуферизованные логи (`PYTHONUNBUFFERED=1`).
+# Autodeploy verification
