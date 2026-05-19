@@ -26,6 +26,39 @@ def normalize_task(text: str) -> str:
     return text.lower().strip()
 
 
+_TRANSLIT_MAP: dict[str, str] = {
+    "а": "a",  "б": "b",  "в": "v",  "г": "g",  "д": "d",  "е": "e",
+    "ё": "yo", "ж": "zh", "з": "z",  "и": "i",  "й": "y",  "к": "k",
+    "л": "l",  "м": "m",  "н": "n",  "о": "o",  "п": "p",  "р": "r",
+    "с": "s",  "т": "t",  "у": "u",  "ф": "f",  "х": "kh", "ц": "ts",
+    "ч": "ch", "ш": "sh", "щ": "sch","ъ": "",   "ы": "y",  "ь": "",
+    "э": "e",  "ю": "yu", "я": "ya",
+}
+_TRANSLIT_MAP.update({k.upper(): v.capitalize() for k, v in _TRANSLIT_MAP.items() if k.upper() != k})
+
+
+def transliterate(text: str) -> str:
+    """Convert Cyrillic text to Latin approximation for name matching."""
+    return "".join(_TRANSLIT_MAP.get(ch, ch) for ch in text).strip()
+
+
+def _name_matches(query: str, full_name: str) -> bool:
+    """Match query against full_name, trying both original and transliterated forms."""
+    q = query.lower()
+    name = full_name.lower()
+    if q in name:
+        return True
+    # Try transliterating the query (Герман → german) and match against stored Latin name
+    q_translit = transliterate(query).lower()
+    if q_translit and q_translit in name:
+        return True
+    # Also try transliterating the stored name (German → german) and match against Cyrillic query
+    name_translit = transliterate(full_name).lower()
+    if q in name_translit:
+        return True
+    return False
+
+
 def _parse_native_checklist(checklist) -> tuple[int, int, list]:
     """Parse Telegram native checklist (Bot API 9.1+, aiogram 3.21+)."""
     tasks = []
@@ -189,34 +222,50 @@ def _guard(fn):
 # /start  /help
 # ---------------------------------------------------------------------------
 
-HELP_TEXT = (
-    "🤖 *Команды бота:*\n\n"
+HELP_STATIC = (
     "📊 /report — текущий срез\n"
-    "Последний чек\\-лист каждого участника: прогресс и незакрытые задачи\\.\n\n"
+    "Последний чек-лист каждого: прогресс и незакрытые задачи.\n\n"
     "🌙 /eod — итоги дня\n"
-    "Кто что не закрыл\\. Задачи, которые висят 2\\+ дня — помечены 🟡, 3\\+ — 🔴\\.\n\n"
-    "🔍 /person \\[имя\\] — аналитика по человеку\n"
-    "Среднее выполнение, хронические задачи \\(3\\+ раз не закрыты\\), задачи которые тихо исчезли незакрытыми\\.\n"
-    "_Пример:_ /person Герман\n\n"
+    "Кто что не закрыл. Задачи 2+ дня — 🟡, 3+ — 🔴.\n\n"
+    "🔍 /person [имя] — аналитика по человеку\n"
+    "Среднее %, хронические задачи, брошенные незакрытыми.\n"
+    "Принимает русские и латинские имена: /person Герман или /person German\n\n"
     "❓ /help — это сообщение"
 )
+
+
+async def _build_help(session) -> str:
+    stmt = select(TaskList.user_id, TaskList.user_full_name).distinct().order_by(TaskList.user_full_name)
+    result = await session.execute(stmt)
+    users = result.all()
+
+    text = "🤖 **Команды бота:**\n\n" + HELP_STATIC
+    if users:
+        text += "\n\n👥 **Участники в базе:**\n"
+        for _, name in users:
+            first = name.split()[0]
+            text += f"• /person {first}\n"
+    return text
 
 
 @dp.message(Command("start"), F.chat.type == "private")
 @_guard
 async def cmd_start(message: types.Message):
+    async with async_session() as session:
+        text = await _build_help(session)
     await message.answer(
-        "Привет, Вера\\! Я — твой личный Аналитик планов 🕵️‍♀️\n\n"
-        "Тихо слежу за чек\\-листами в группе, тебе отвечаю здесь\\.\n\n"
-        + HELP_TEXT,
-        parse_mode="MarkdownV2",
+        "Привет, Вера! Я — твой личный Аналитик планов 🕵️‍♀️\n\n"
+        "Тихо слежу за чек-листами в группе, тебе отвечаю здесь.\n\n" + text,
+        parse_mode="Markdown",
     )
 
 
 @dp.message(Command("help"), F.chat.type == "private")
 @_guard
 async def cmd_help(message: types.Message):
-    await message.answer(HELP_TEXT, parse_mode="MarkdownV2")
+    async with async_session() as session:
+        text = await _build_help(session)
+    await message.answer(text, parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
@@ -326,11 +375,11 @@ async def cmd_person(message: types.Message):
         all_users = result.all()
 
         match = next(
-            ((uid, name) for uid, name in all_users if name_query in name.lower()),
+            ((uid, name) for uid, name in all_users if _name_matches(args[1].strip(), name)),
             None,
         )
         if not match:
-            await message.answer(f"Не нашла участника «{args[1]}». Попробуй часть имени, например: /person Герман")
+            await message.answer(f"Не нашла участника «{args[1]}». Попробуй часть имени, например: /person Герман или /person German")
             return
 
         user_id, user_full_name = match
