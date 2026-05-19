@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import functools
 from collections import Counter, defaultdict
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -175,12 +176,12 @@ def is_admin(message: types.Message) -> bool:
 
 def _guard(fn):
     """Decorator: reject non-admins in private chat."""
+    @functools.wraps(fn)
     async def wrapper(message: types.Message, *args, **kwargs):
         if not is_admin(message):
             await message.answer("ты не Вера, я тебе не помогу)")
             return
         return await fn(message, *args, **kwargs)
-    wrapper.__name__ = fn.__name__
     return wrapper
 
 
@@ -408,8 +409,7 @@ async def cmd_person(message: types.Message):
             report += "\n"
 
         if chronic:
-            report += f"🔴 **Хронические задачи** _(3\\+ раз не закрыты):_\n" if False else \
-                      f"🔴 **Хронические задачи** (3+ раз не закрыты):\n"
+            report += "🔴 **Хронические задачи** (3+ раз не закрыты):\n"
             for text, cnt in chronic[:7]:
                 report += f"• {text} — {cnt}x\n"
             report += "\n"
