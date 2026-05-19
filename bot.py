@@ -5,7 +5,7 @@ from aiogram.filters import Command
 from datetime import datetime
 
 from config import BOT_TOKEN, ADMIN_ID
-from sqlalchemy import select, update, delete
+from sqlalchemy import select, delete, func
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -123,39 +123,43 @@ async def cmd_report(message: types.Message):
         return
 
     async with async_session() as session:
-        # Получаем все списки
-        stmt = select(TaskList).order_by(TaskList.user_full_name, TaskList.created_at.desc())
+        # Берём только последний чек-лист каждого участника (по user_id + max created_at)
+        subq = (
+            select(TaskList.user_id, func.max(TaskList.created_at).label("max_date"))
+            .group_by(TaskList.user_id)
+            .subquery()
+        )
+        stmt = (
+            select(TaskList)
+            .join(subq, (TaskList.user_id == subq.c.user_id) & (TaskList.created_at == subq.c.max_date))
+            .order_by(TaskList.user_full_name)
+        )
         result = await session.execute(stmt)
-        all_lists = result.scalars().all()
-        
-        if not all_lists:
+        latest_lists = result.scalars().all()
+
+        if not latest_lists:
             await message.answer("Данных пока нет. Я начну собирать их, как только в группе появятся новые списки задач.")
             return
 
         report = "📊 **Анализ выполнения задач:**\n\n"
-        
-        users_stats = {}
-        for l in all_lists:
-            if l.user_full_name not in users_stats:
-                users_stats[l.user_full_name] = {"total": 0, "done": 0, "pending_examples": []}
-            
-            users_stats[l.user_full_name]["total"] += l.total_tasks
-            users_stats[l.user_full_name]["done"] += l.completed_tasks
-            
-            if l.completed_tasks < l.total_tasks:
-                items_stmt = select(TaskItem).where(TaskItem.list_id == l.id, TaskItem.is_completed == False).limit(2)
+
+        for tl in latest_lists:
+            percent = (tl.completed_tasks / tl.total_tasks * 100) if tl.total_tasks > 0 else 0
+            date_str = tl.created_at.strftime("%d.%m") if tl.created_at else "?"
+            report += f"👤 **{tl.user_full_name}** _(список от {date_str})_\n"
+            report += f"└ Прогресс: {tl.completed_tasks}/{tl.total_tasks} ({percent:.1f}%)\n"
+
+            if tl.completed_tasks < tl.total_tasks:
+                items_stmt = (
+                    select(TaskItem)
+                    .where(TaskItem.list_id == tl.id, TaskItem.is_completed == False)
+                    .limit(3)
+                )
                 items_res = await session.execute(items_stmt)
                 pending = items_res.scalars().all()
-                for p in pending:
-                    clean_text = p.text.replace("🔘", "").replace("⚪", "").strip()
-                    users_stats[l.user_full_name]["pending_examples"].append(f"• {clean_text}")
+                if pending:
+                    report += "└ Что тянет:\n" + "\n".join(f"• {p.text}" for p in pending) + "\n"
 
-        for user, data in users_stats.items():
-            percent = (data["done"] / data["total"] * 100) if data["total"] > 0 else 0
-            report += f"👤 **{user}**\n"
-            report += f"└ Прогресс: {data['done']}/{data['total']} ({percent:.1f}%)\n"
-            if data["pending_examples"]:
-                report += f"└ Что тянет (примеры):\n" + "\n".join(data["pending_examples"][:3]) + "\n"
             report += "\n"
 
         await message.answer(report, parse_mode="Markdown")
